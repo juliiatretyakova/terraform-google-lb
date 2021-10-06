@@ -1,191 +1,300 @@
+/**
+ * Copyright 2020 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
-provider "google" {
 
+locals {
+  address      = var.create_address ? join("", google_compute_global_address.default.*.address) : var.address
+  ipv6_address = var.create_ipv6_address ? join("", google_compute_global_address.default_ipv6.*.address) : var.ipv6_address
+
+  url_map             = var.create_url_map ? join("", google_compute_url_map.default.*.self_link) : var.url_map
+  create_http_forward = var.http_forward || var.https_redirect
+
+  health_checked_backends = { for backend_index, backend_value in var.backends : backend_index => backend_value if backend_value["health_check"] != null }
 }
 
-resource "google_compute_network" "ilb_network" {
-  name                    = "l7-ilb-network"
-  provider                = google-beta
-  auto_create_subnetworks = false
+### IPv4 block ###
+resource "google_compute_global_forwarding_rule" "http" {
+  project    = var.project
+  count      = local.create_http_forward ? 1 : 0
+  name       = var.name
+  target     = google_compute_target_http_proxy.default[0].self_link
+  ip_address = local.address
+  port_range = "80"
 }
 
-# proxy-only subnet
-resource "google_compute_subnetwork" "proxy_subnet" {
-  name          = "l7-ilb-proxy-subnet"
-  provider      = google-beta
-  ip_cidr_range = "10.0.0.0/24"
-  region        = "europe-west1"
-  purpose       = "INTERNAL_HTTPS_LOAD_BALANCER"
-  role          = "ACTIVE"
-  network       = google_compute_network.ilb_network.id
+resource "google_compute_global_forwarding_rule" "https" {
+  project    = var.project
+  count      = var.ssl ? 1 : 0
+  name       = "${var.name}-https"
+  target     = google_compute_target_https_proxy.default[0].self_link
+  ip_address = local.address
+  port_range = "443"
 }
 
-# backed subnet
-resource "google_compute_subnetwork" "ilb_subnet" {
-  name          = "l7-ilb-subnet"
-  provider      = google-beta
-  ip_cidr_range = "10.0.1.0/24"
-  region        = "europe-west1"
-  network       = google_compute_network.ilb_network.id
+resource "google_compute_global_address" "default" {
+  count      = var.create_address ? 1 : 0
+  project    = var.project
+  name       = "${var.name}-address"
+  ip_version = "IPV4"
+}
+### IPv4 block ###
+
+### IPv6 block ###
+resource "google_compute_global_forwarding_rule" "http_ipv6" {
+  project    = var.project
+  count      = (var.enable_ipv6 && local.create_http_forward) ? 1 : 0
+  name       = "${var.name}-ipv6-http"
+  target     = google_compute_target_http_proxy.default[0].self_link
+  ip_address = local.ipv6_address
+  port_range = "80"
 }
 
-# forwarding rule
-resource "google_compute_forwarding_rule" "google_compute_forwarding_rule" {
-  name                  = "l7-ilb-forwarding-rule"
-  provider              = google-beta
-  region                = "europe-west1"
-  depends_on            = [google_compute_subnetwork.proxy_subnet]
-  ip_protocol           = "TCP"
-  load_balancing_scheme = "INTERNAL_MANAGED"
-  port_range            = "80"
-  target                = google_compute_region_target_http_proxy.default.id
-  network               = google_compute_network.ilb_network.id
-  subnetwork            = google_compute_subnetwork.ilb_subnet.id
-  network_tier          = "PREMIUM"
+resource "google_compute_global_forwarding_rule" "https_ipv6" {
+  project    = var.project
+  count      = (var.enable_ipv6 && var.ssl) ? 1 : 0
+  name       = "${var.name}-ipv6-https"
+  target     = google_compute_target_https_proxy.default[0].self_link
+  ip_address = local.ipv6_address
+  port_range = "443"
 }
 
-# http proxy
-resource "google_compute_region_target_http_proxy" "default" {
-  name     = "l7-ilb-target-http-proxy"
-  provider = google-beta
-  region   = "europe-west1"
-  url_map  = google_compute_region_url_map.default.id
+resource "google_compute_global_address" "default_ipv6" {
+  count      = (var.enable_ipv6 && var.create_ipv6_address) ? 1 : 0
+  project    = var.project
+  name       = "${var.name}-ipv6-address"
+  ip_version = "IPV6"
+}
+### IPv6 block ###
+
+# HTTP proxy when http forwarding is true
+resource "google_compute_target_http_proxy" "default" {
+  project = var.project
+  count   = local.create_http_forward ? 1 : 0
+  name    = "${var.name}-http-proxy"
+  url_map = var.https_redirect == false ? local.url_map : join("", google_compute_url_map.https_redirect.*.self_link)
 }
 
-# url map
-resource "google_compute_region_url_map" "default" {
-  name            = "l7-ilb-regional-url-map"
-  provider        = google-beta
-  region          = "europe-west1"
-  default_service = google_compute_region_backend_service.default.id
+# HTTPS proxy when ssl is true
+resource "google_compute_target_https_proxy" "default" {
+  project = var.project
+  count   = var.ssl ? 1 : 0
+  name    = "${var.name}-https-proxy"
+  url_map = local.url_map
+
+  ssl_certificates = compact(concat(var.ssl_certificates, google_compute_ssl_certificate.default.*.self_link, google_compute_managed_ssl_certificate.default.*.self_link, ), )
+  ssl_policy       = var.ssl_policy
+  quic_override    = var.quic ? "ENABLE" : null
 }
 
-# backend service
-resource "google_compute_region_backend_service" "default" {
-  name                  = "l7-ilb-backend-subnet"
-  provider              = google-beta
-  region                = "europe-west1"
-  protocol              = "HTTP"
-  load_balancing_scheme = "INTERNAL_MANAGED"
-  timeout_sec           = 10
-  health_checks         = [google_compute_region_health_check.default.id]
-  backend {
-    group           = google_compute_region_instance_group_manager.mig.instance_group
-    balancing_mode  = "UTILIZATION"
-    capacity_scaler = 1.0
-  }
-}
+resource "google_compute_ssl_certificate" "default" {
+  project     = var.project
+  count       = var.ssl && length(var.managed_ssl_certificate_domains) == 0 && ! var.use_ssl_certificates ? 1 : 0
+  name_prefix = "${var.name}-certificate-"
+  private_key = var.private_key
+  certificate = var.certificate
 
-# instance template
-resource "google_compute_instance_template" "instance_template" {
-  name         = "l7-ilb-mig-template"
-  provider     = google-beta
-  machine_type = "e2-small"
-  tags         = ["http-server"]
-
-  network_interface {
-    network    = google_compute_network.ilb_network.id
-    subnetwork = google_compute_subnetwork.ilb_subnet.id
-    access_config {
-      # add external ip to fetch packages
-    }
-  }
-  disk {
-    source_image = "debian-cloud/debian-10"
-    auto_delete  = true
-    boot         = true
-  }
-
-  # install nginx and serve a simple web page
-  metadata = {
-    startup-script = <<-EOF1
-      #! /bin/bash
-      set -euo pipefail
-
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update
-      apt-get install -y nginx-light jq
-
-      NAME=$(curl -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/hostname")
-      IP=$(curl -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip")
-      METADATA=$(curl -f -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/?recursive=True" | jq 'del(.["startup-script"])')
-
-      cat <<EOF > /var/www/html/index.html
-      <pre>
-      Name: $NAME
-      IP: $IP
-      Metadata: $METADATA
-      </pre>
-      EOF
-    EOF1
-  }
   lifecycle {
     create_before_destroy = true
   }
 }
 
-# health check
-resource "google_compute_region_health_check" "default" {
-  name     = "l7-ilb-hc"
+resource "random_id" "certificate" {
+  count       = var.random_certificate_suffix == true ? 1 : 0
+  byte_length = 4
+  prefix      = "${var.name}-cert-"
+
+  keepers = {
+    domains = join(",", var.managed_ssl_certificate_domains)
+  }
+}
+
+resource "google_compute_managed_ssl_certificate" "default" {
   provider = google-beta
-  region   = "europe-west1"
-  http_health_check {
-    port_specification = "USE_SERVING_PORT"
+  project  = var.project
+  count    = var.ssl && length(var.managed_ssl_certificate_domains) > 0 && ! var.use_ssl_certificates ? 1 : 0
+  name     = var.random_certificate_suffix == true ? random_id.certificate[0].hex : "${var.name}-cert"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  managed {
+    domains = var.managed_ssl_certificate_domains
   }
 }
 
-# MIG
-resource "google_compute_region_instance_group_manager" "mig" {
-  name     = "l7-ilb-mig1"
+resource "google_compute_url_map" "default" {
+  project         = var.project
+  count           = var.create_url_map ? 1 : 0
+  name            = "${var.name}-url-map"
+  default_service = google_compute_backend_service.default[keys(var.backends)[0]].self_link
+}
+
+resource "google_compute_url_map" "https_redirect" {
+  project = var.project
+  count   = var.https_redirect ? 1 : 0
+  name    = "${var.name}-https-redirect"
+  default_url_redirect {
+    https_redirect         = true
+    redirect_response_code = "MOVED_PERMANENTLY_DEFAULT"
+    strip_query            = false
+  }
+}
+
+resource "google_compute_backend_service" "default" {
   provider = google-beta
-  region   = "europe-west1"
-  version {
-    instance_template = google_compute_instance_template.instance_template.id
-    name              = "primary"
+  for_each = var.backends
+
+  project = var.project
+  name    = "${var.name}-backend-${each.key}"
+
+  port_name = each.value.port_name
+  protocol  = each.value.protocol
+
+  timeout_sec                     = lookup(each.value, "timeout_sec", null)
+  description                     = lookup(each.value, "description", null)
+  connection_draining_timeout_sec = lookup(each.value, "connection_draining_timeout_sec", null)
+  enable_cdn                      = lookup(each.value, "enable_cdn", false)
+  custom_request_headers          = lookup(each.value, "custom_request_headers", [])
+  custom_response_headers         = lookup(each.value, "custom_response_headers", [])
+  health_checks                   = lookup(each.value, "health_check", null) == null ? null : [google_compute_health_check.default[each.key].self_link]
+  session_affinity                = lookup(each.value, "session_affinity", null)
+  affinity_cookie_ttl_sec         = lookup(each.value, "affinity_cookie_ttl_sec", null)
+
+  # To achieve a null backend security_policy, set each.value.security_policy to "" (empty string), otherwise, it fallsback to var.security_policy.
+  security_policy = lookup(each.value, "security_policy") == "" ? null : (lookup(each.value, "security_policy") == null ? var.security_policy : each.value.security_policy)
+
+  dynamic "backend" {
+    for_each = toset(each.value["groups"])
+    content {
+      description = lookup(backend.value, "description", null)
+      group       = lookup(backend.value, "group")
+
+      balancing_mode               = lookup(backend.value, "balancing_mode")
+      capacity_scaler              = lookup(backend.value, "capacity_scaler")
+      max_connections              = lookup(backend.value, "max_connections")
+      max_connections_per_instance = lookup(backend.value, "max_connections_per_instance")
+      max_connections_per_endpoint = lookup(backend.value, "max_connections_per_endpoint")
+      max_rate                     = lookup(backend.value, "max_rate")
+      max_rate_per_instance        = lookup(backend.value, "max_rate_per_instance")
+      max_rate_per_endpoint        = lookup(backend.value, "max_rate_per_endpoint")
+      max_utilization              = lookup(backend.value, "max_utilization")
+    }
   }
-  base_instance_name = "vm"
-  target_size        = 2
+
+  log_config {
+    enable      = lookup(lookup(each.value, "log_config", {}), "enable", true)
+    sample_rate = lookup(lookup(each.value, "log_config", {}), "sample_rate", "1.0")
+  }
+
+  dynamic "iap" {
+    for_each = lookup(lookup(each.value, "iap_config", {}), "enable", false) ? [1] : []
+    content {
+      oauth2_client_id     = lookup(lookup(each.value, "iap_config", {}), "oauth2_client_id", "")
+      oauth2_client_secret = lookup(lookup(each.value, "iap_config", {}), "oauth2_client_secret", "")
+    }
+  }
+
+  depends_on = [
+    google_compute_health_check.default
+  ]
+
 }
 
-# allow all access from IAP and health check ranges
-resource "google_compute_firewall" "fw-iap" {
-  name          = "l7-ilb-fw-allow-iap-hc"
-  provider      = google-beta
-  direction     = "INGRESS"
-  network       = google_compute_network.ilb_network.id
-  source_ranges = ["130.211.0.0/22", "35.191.0.0/16", "35.235.240.0/20"]
-  allow {
-    protocol = "tcp"
+resource "google_compute_health_check" "default" {
+  provider = google-beta
+  for_each = local.health_checked_backends
+  project  = var.project
+  name     = "${var.name}-hc-${each.key}"
+
+  check_interval_sec  = lookup(each.value["health_check"], "check_interval_sec", 5)
+  timeout_sec         = lookup(each.value["health_check"], "timeout_sec", 5)
+  healthy_threshold   = lookup(each.value["health_check"], "healthy_threshold", 2)
+  unhealthy_threshold = lookup(each.value["health_check"], "unhealthy_threshold", 2)
+
+  log_config {
+    enable = lookup(each.value["health_check"], "logging", false)
+  }
+
+  dynamic "http_health_check" {
+    for_each = each.value["protocol"] == "HTTP" ? [
+      {
+        host         = lookup(each.value["health_check"], "host", null)
+        request_path = lookup(each.value["health_check"], "request_path", null)
+        port         = lookup(each.value["health_check"], "port", null)
+      }
+    ] : []
+
+    content {
+      host         = lookup(http_health_check.value, "host", null)
+      request_path = lookup(http_health_check.value, "request_path", null)
+      port         = lookup(http_health_check.value, "port", null)
+    }
+  }
+
+  dynamic "https_health_check" {
+    for_each = each.value["protocol"] == "HTTPS" ? [
+      {
+        host         = lookup(each.value["health_check"], "host", null)
+        request_path = lookup(each.value["health_check"], "request_path", null)
+        port         = lookup(each.value["health_check"], "port", null)
+      }
+    ] : []
+
+    content {
+      host         = lookup(https_health_check.value, "host", null)
+      request_path = lookup(https_health_check.value, "request_path", null)
+      port         = lookup(https_health_check.value, "port", null)
+    }
+  }
+
+  dynamic "http2_health_check" {
+    for_each = each.value["protocol"] == "HTTP2" ? [
+      {
+        host         = lookup(each.value["health_check"], "host", null)
+        request_path = lookup(each.value["health_check"], "request_path", null)
+        port         = lookup(each.value["health_check"], "port", null)
+      }
+    ] : []
+
+    content {
+      host         = lookup(http2_health_check.value, "host", null)
+      request_path = lookup(http2_health_check.value, "request_path", null)
+      port         = lookup(http2_health_check.value, "port", null)
+    }
   }
 }
 
-# allow http from proxy subnet to backends
-resource "google_compute_firewall" "fw-ilb-to-backends" {
-  name          = "l7-ilb-fw-allow-ilb-to-backends"
-  provider      = google-beta
-  direction     = "INGRESS"
-  network       = google_compute_network.ilb_network.id
-  source_ranges = ["10.0.0.0/24"]
-  target_tags   = ["http-server"]
-  allow {
-    protocol = "tcp"
-    ports    = ["80", "443", "8080"]
-  }
-}
+resource "google_compute_firewall" "default-hc" {
+  count   = length(var.firewall_networks)
+  project = length(var.firewall_networks) == 1 && var.firewall_projects[0] == "default" ? var.project : var.firewall_projects[count.index]
+  name    = "${var.name}-hc-${count.index}"
+  network = var.firewall_networks[count.index]
+  source_ranges = [
+    "130.211.0.0/22",
+    "35.191.0.0/16"
+  ]
+  target_tags             = length(var.target_tags) > 0 ? var.target_tags : null
+  target_service_accounts = length(var.target_service_accounts) > 0 ? var.target_service_accounts : null
 
-# test instance
-resource "google_compute_instance" "vm-test" {
-  name         = "l7-ilb-test-vm"
-  provider     = google-beta
-  zone         = "europe-west1-b"
-  machine_type = "e2-small"
-  network_interface {
-    network    = google_compute_network.ilb_network.id
-    subnetwork = google_compute_subnetwork.ilb_subnet.id
-  }
-  boot_disk {
-    initialize_params {
-      image = "debian-cloud/debian-10"
+  dynamic "allow" {
+    for_each = local.health_checked_backends
+    content {
+      protocol = "tcp"
+      ports    = [allow.value["health_check"].port]
     }
   }
 }
