@@ -1,3 +1,8 @@
+
+provider "google" {
+
+}
+
 resource "google_compute_network" "ilb_network" {
   name                    = "l7-ilb-network"
   provider                = google-beta
